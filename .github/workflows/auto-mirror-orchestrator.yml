@@ -1,0 +1,114 @@
+name: Auto-mirror new repos to GitVerse
+
+on:
+  repository:
+    types: [created]
+
+permissions:
+  contents: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve repo metadata
+        id: meta
+        run: |
+          echo "repo=${{ github.event.repository.name }}"                          >> "$GITHUB_OUTPUT"
+          echo "owner=${{ github.event.organization.login }}"                      >> "$GITHUB_OUTPUT"
+          echo "private=${{ github.event.repository.private }}"                    >> "$GITHUB_OUTPUT"
+          echo "default_branch=${{ github.event.repository.default_branch }}"      >> "$GITHUB_OUTPUT"
+
+      - name: Create repository on GitVerse (matching visibility)
+        env:
+          GV_TOKEN: ${{ secrets.GITVERSE_TOKEN }}
+          GV_ORG:   ${{ secrets.GITVERSE_ORG }}
+        run: |
+          PRIVATE="${{ steps.meta.outputs.private }}"
+          REPO="${{ steps.meta.outputs.repo }}"
+          HTTP=$(/usr/bin/curl -s -o /tmp/resp.json -w "%{http_code}" \
+            -X POST "https://api.gitverse.ru/orgs/${GV_ORG}/repos" \
+            -H "Authorization: Bearer ${GV_TOKEN}" \
+            -H "Accept: application/vnd.gitverse.object+json;version=1" \
+            -H "Content-Type: application/json" \
+            -d "{\"name\":\"${REPO}\",\"private\":${PRIVATE},\"auto_init\":false}")
+          if [ "$HTTP" != "201" ] && [ "$HTTP" != "409" ]; then
+            echo "::error::GitVerse repo creation failed (HTTP $HTTP)"
+            cat /tmp/resp.json
+            exit 1
+          fi
+          echo "GitVerse repo ready (HTTP $HTTP)"
+
+      - name: Clone source as bare mirror
+        env:
+          GH_TOKEN: ${{ secrets.GH_ORG_TOKEN }}
+        run: |
+          OWNER="${{ steps.meta.outputs.owner }}"
+          REPO="${{ steps.meta.outputs.repo }}"
+          git clone --mirror \
+            "https://x-access-token:${GH_TOKEN}@github.com/${OWNER}/${REPO}.git" repo.git
+
+      - name: Initial mirror push to GitVerse
+        env:
+          GV_TOKEN: ${{ secrets.GITVERSE_TOKEN }}
+          GV_ACTOR: ${{ secrets.GITVERSE_ACTOR }}
+          GV_ORG:   ${{ secrets.GITVERSE_ORG }}
+        run: |
+          REPO="${{ steps.meta.outputs.repo }}"
+          cd repo.git
+          if [ -z "$(git for-each-ref)" ]; then
+            echo "Source repo is empty, skipping push."
+            exit 0
+          fi
+          git push --mirror --force \
+            "https://${GV_ACTOR}:${GV_TOKEN}@gitverse.ru/${GV_ORG}/${REPO}.git"
+
+      - name: Inject per-repo mirror workflow into the new repo
+        env:
+          GH_TOKEN: ${{ secrets.GH_ORG_TOKEN }}
+        run: |
+          OWNER="${{ steps.meta.outputs.owner }}"
+          REPO="${{ steps.meta.outputs.repo }}"
+          BRANCH="${{ steps.meta.outputs.default_branch }}"
+          [ -z "$BRANCH" ] && BRANCH="main"
+          WORKDIR=$(mktemp -d)
+          cd "$WORKDIR"
+          git init -q
+          git checkout -q -b "$BRANCH"
+          mkdir -p .github/workflows
+          cat > .github/workflows/mirror-to-gitverse.yml << 'WORKFLOW'
+name: Mirror to GitVerse
+
+on:
+  push:
+    branches: ['**']
+    tags: ['**']
+
+permissions:
+  contents: read
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mirror push to GitVerse
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GV_TOKEN: ${{ secrets.GITVERSE_TOKEN }}
+          GV_ACTOR: ${{ secrets.GITVERSE_ACTOR }}
+          GV_ORG:   ${{ secrets.GITVERSE_ORG }}
+        run: |
+          REPO="${{ github.event.repository.name }}"
+          OWNER="${{ github.event.repository.owner.login }}"
+          git clone --mirror \
+            "https://x-access-token:${GH_TOKEN}@github.com/${OWNER}/${REPO}.git" repo.git
+          cd repo.git
+          git push --mirror --force \
+            "https://${GV_ACTOR}:${GV_TOKEN}@gitverse.ru/${GV_ORG}/${REPO}.git"
+WORKFLOW
+          git add .github/workflows/mirror-to-gitverse.yml
+          git -c user.name="mirror-bot" -c user.email="mirror-bot@users.noreply.github.com" \
+            commit -q -m "ci: add GitVerse mirror workflow"
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${OWNER}/${REPO}.git"
+          git push origin "HEAD:${BRANCH}" 2>/dev/null \
+            || echo "Repo already has content; workflow should be added via PR."
